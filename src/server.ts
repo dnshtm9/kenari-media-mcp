@@ -15,6 +15,7 @@ import {
   imageCostIdr,
   isImageModel,
   isVideoGenModel,
+  videoCostIdr,
   type KenariModel,
 } from "./kenari/catalog.js";
 import {
@@ -146,6 +147,7 @@ async function saveFromUrlOrData(
   const { bytes, contentType } = await getBytes(url, {
     fetchImpl,
     apiKey: cfg.apiKey,
+    baseUrl: cfg.baseUrl,
     timeoutMs: cfg.imageTimeoutMs,
   });
   const ext = pickExt(bytes, contentType, fallbackExt);
@@ -159,15 +161,19 @@ export function createServer(deps: ServerDeps = {}): McpServer {
   const sleep = deps.sleepMs ?? sleepDefault;
 
   /**
-   * PRE-flight cost cap: estimate (per-image IDR from catalog pricing_lines *
-   * n) BEFORE any Kenari POST. Returns an err ToolResult when over the cap,
-   * null when allowed. Unknown model/price never blocks (stderr warning).
+   * PRE-flight cost cap: estimate cost (from catalog pricing_lines) BEFORE any
+   * Kenari POST. Images: per-image IDR * n. Video: per-second IDR * duration,
+   * or a flat per-call price when the unit suggests it. Returns an err
+   * ToolResult when over the cap, null when allowed. Unknown model/price never
+   * blocks (stderr warning) — fail-open, same posture for both modalities.
+   * Reuses KENARI_MAX_COST_IDR_PER_CALL for both image and video calls.
    */
   async function preflightCostCap(
     cfg: KenariConfig,
     model: string,
-    n: number,
+    quantity: number,
     op: string,
+    modality: "image" | "video" = "image",
   ): Promise<ReturnType<typeof err> | null> {
     if (cfg.maxCostIdrPerCall === undefined) return null;
     let raw: Array<Record<string, unknown>>;
@@ -179,12 +185,20 @@ export function createServer(deps: ServerDeps = {}): McpServer {
       return null; // Catalog lookup is best-effort; never block on lookup failure.
     }
     const found = (raw as unknown as KenariModel[]).find((m) => m.id === model);
-    const per = found ? imageCostIdr(found) : undefined;
-    if (per === undefined) {
+    let estimate: number | undefined;
+    if (found && modality === "video") {
+      const vid = videoCostIdr(found);
+      // Per-second price scales with duration; a flat per-call price does not.
+      if (vid?.perSecond !== undefined) estimate = vid.perSecond * quantity;
+      else if (vid?.flatPerCall !== undefined) estimate = vid.flatPerCall;
+    } else if (found) {
+      const per = imageCostIdr(found);
+      if (per !== undefined) estimate = per * quantity;
+    }
+    if (estimate === undefined) {
       console.error(`[kenari-media-mcp] ${op}: no catalog price for model ${model}; skipping cost cap.`);
       return null;
     }
-    const estimate = per * n;
     if (estimate > cfg.maxCostIdrPerCall) {
       return err(
         `bad_request: estimated cost ${estimate} IDR exceeds KENARI_MAX_COST_IDR_PER_CALL=${cfg.maxCostIdrPerCall}.`,
@@ -342,6 +356,9 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         // Local file errors should surface as bad_request, not upstream.
         if (e instanceof KenariError) return errFromKenari(e, "edit_image");
         const msg = e instanceof Error ? e.message : String(e);
+        if (/refused to read likely sensitive file/i.test(msg)) {
+          return err(`bad_request: ${msg}`, { code: "bad_request", op: "edit_image" });
+        }
         if (/ENOENT|no such file/i.test(msg)) {
           return err(`bad_request: image file not found: ${args.image_path}`, {
             code: "bad_request",
@@ -412,6 +429,17 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         const v = args[k];
         if (v !== undefined) body[k] = v;
       }
+      if (cfg.maxCostIdrPerCall !== undefined) {
+        // Cost cap BEFORE any POST — mirrors generate_image/edit_image.
+        const blocked = await preflightCostCap(
+          cfg,
+          args.model,
+          args.duration ?? cfg.maxVideoDuration,
+          "create_video",
+          "video",
+        );
+        if (blocked) return blocked;
+      }
       try {
         const { parsed } = await postJson("/videos/generations", cfg, body, {
           context: "video",
@@ -464,6 +492,17 @@ export function createServer(deps: ServerDeps = {}): McpServer {
       const body: Record<string, unknown> = { model: args.model, video: { url: videoRef } };
       if (args.prompt) body.prompt = args.prompt;
       if (args.duration !== undefined) body.duration = args.duration;
+      if (cfg.maxCostIdrPerCall !== undefined) {
+        // Cost cap BEFORE the extension POST — mirrors create_video.
+        const blocked = await preflightCostCap(
+          cfg,
+          args.model,
+          args.duration ?? cfg.maxVideoDuration,
+          "extend_video",
+          "video",
+        );
+        if (blocked) return blocked;
+      }
       try {
         const { parsed } = await postJson("/videos/extensions", cfg, body, {
           context: "video",
@@ -620,7 +659,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         }
         const { bytes, contentType } = await getBytes(
           `${cfg.baseUrl}/videos/${encodeURIComponent(args.id)}/content`,
-          { fetchImpl: getDepsFetch(deps), apiKey: cfg.apiKey, timeoutMs: cfg.imageTimeoutMs },
+          { fetchImpl: getDepsFetch(deps), apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, timeoutMs: cfg.imageTimeoutMs },
         );
         const ext = pickExt(bytes, contentType, ".mp4");
         const p = await saveBytes(cfg.outputDir, `video-${args.id}`, ext, bytes);
@@ -705,7 +744,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         }
         const { bytes, contentType } = await getBytes(
           `${cfg.baseUrl}/videos/${encodeURIComponent(id)}/content`,
-          { fetchImpl, apiKey: cfg.apiKey, timeoutMs: cfg.imageTimeoutMs },
+          { fetchImpl, apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, timeoutMs: cfg.imageTimeoutMs },
         );
         const ext = pickExt(bytes, contentType, ".mp4");
         const p = await saveBytes(cfg.outputDir, `video-${id}`, ext, bytes);

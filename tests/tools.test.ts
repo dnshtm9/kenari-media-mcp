@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -250,6 +250,177 @@ describe("edit_image", () => {
       background: "transparent",
     });
     assert.equal(parsed.success, false);
+  });
+});
+
+describe("video cost cap (create_video / extend_video)", () => {
+  it("create_video blocks BEFORE any POST when over cap (no fetch to /videos/generations)", async () => {
+    const { impl, calls } = mockFetch([
+      {
+        match: () => true,
+        respond: () => json({ id: "job-nope" }),
+      },
+    ]);
+    const res = await invoke(
+      "create_video",
+      { model: "vid-sec", prompt: "p", duration: 10 },
+      {
+        env: { ...baseEnv(), KENARI_MAX_COST_IDR_PER_CALL: "100" } as NodeJS.ProcessEnv,
+        fetchImpl: impl,
+        modelList: async () => [
+          {
+            id: "vid-sec",
+            endpoints: ["videos"],
+            pricing_lines: [
+              { billable: "output_video", unit: "second", micro_idr: 50_000_000, variant: null },
+            ],
+          },
+        ],
+      },
+    );
+    assert.equal(res.isError, true, JSON.stringify(res));
+    assert.equal(res.structuredContent!.code, "bad_request");
+    assert.match(String(res.structuredContent!.content?.[0]?.text ?? res.content[0].text), /estimated cost 500 IDR/);
+    assert.ok(
+      !calls.some((c) => c.url.endsWith("/videos/generations")),
+      "must not POST when over cap",
+    );
+  });
+  it("extend_video blocks BEFORE any POST when over cap", async () => {
+    const { impl, calls } = mockFetch([
+      {
+        match: () => true,
+        respond: () => json({ id: "job-nope" }),
+      },
+    ]);
+    const res = await invoke(
+      "extend_video",
+      { model: "vid-sec", source: "https://cdn/src.mp4", duration: 10 },
+      {
+        env: { ...baseEnv(), KENARI_MAX_COST_IDR_PER_CALL: "100" } as NodeJS.ProcessEnv,
+        fetchImpl: impl,
+        modelList: async () => [
+          {
+            id: "vid-sec",
+            endpoints: ["videos"],
+            pricing_lines: [
+              { billable: "output_video", unit: "second", micro_idr: 50_000_000, variant: null },
+            ],
+          },
+        ],
+      },
+    );
+    assert.equal(res.isError, true, JSON.stringify(res));
+    assert.equal(res.structuredContent!.code, "bad_request");
+    assert.ok(
+      !calls.some((c) => c.url.endsWith("/videos/extensions")),
+      "must not POST when over cap",
+    );
+  });
+  it("create_video fail-open when video price unknown (model not in catalog)", async () => {
+    const { impl } = mockFetch([
+      {
+        match: (u) => u.endsWith("/videos/generations"),
+        respond: () => json({ id: "job-open" }),
+      },
+    ]);
+    const res = await invoke(
+      "create_video",
+      { model: "no-such-video-model", prompt: "p" },
+      {
+        env: { ...baseEnv(), KENARI_MAX_COST_IDR_PER_CALL: "1" } as NodeJS.ProcessEnv,
+        fetchImpl: impl,
+        modelList: async () => FIXTURE_MODELS,
+      },
+    );
+    assert.ok(!res.isError, JSON.stringify(res));
+  });
+  it("create_video fail-open when catalog lookup itself fails", async () => {
+    const { impl } = mockFetch([
+      {
+        match: (u) => u.endsWith("/videos/generations"),
+        respond: () => json({ id: "job-open2" }),
+      },
+    ]);
+    const res = await invoke(
+      "create_video",
+      { model: "vid-sec", prompt: "p" },
+      {
+        env: { ...baseEnv(), KENARI_MAX_COST_IDR_PER_CALL: "1" } as NodeJS.ProcessEnv,
+        fetchImpl: impl,
+        modelList: async () => {
+          throw new Error("catalog down");
+        },
+      },
+    );
+    assert.ok(!res.isError, JSON.stringify(res));
+  });
+  it("create_video allows when estimate is within cap", async () => {
+    const { impl } = mockFetch([
+      {
+        match: (u) => u.endsWith("/videos/generations"),
+        respond: () => json({ id: "job-ok" }),
+      },
+    ]);
+    const res = await invoke(
+      "create_video",
+      { model: "vid-flat", prompt: "p" },
+      {
+        env: { ...baseEnv(), KENARI_MAX_COST_IDR_PER_CALL: "10" } as NodeJS.ProcessEnv,
+        fetchImpl: impl,
+        modelList: async () => [
+          {
+            id: "vid-flat",
+            endpoints: ["videos"],
+            pricing_lines: [
+              { billable: "output_video", unit: "call", micro_idr: 10_000_000, variant: null },
+            ],
+          },
+        ],
+      },
+    );
+    assert.ok(!res.isError, JSON.stringify(res));
+  });
+  it("edit_image sensitive image_path fails bad_request with zero fetch", async () => {
+    let fetched = false;
+    const impl = (async () => {
+      fetched = true;
+      throw new Error("should not fetch");
+    }) as typeof fetch;
+    for (const p of ["C:\\proj\\.env", "C:\\keys\\id_rsa", "C:\\keys\\a.pem"]) {
+      const res = await invoke(
+        "edit_image",
+        { model: "gpt-image-2", prompt: "x", image_path: p },
+        { env: baseEnv(), fetchImpl: impl },
+      );
+      assert.equal(res.isError, true, p);
+      assert.equal(res.structuredContent!.code, "bad_request");
+      assert.match(String(res.content[0].text), /refused to read likely sensitive file/);
+    }
+    assert.equal(fetched, false, "no HTTP call may be made for blocked paths");
+  });
+  it("edit_image sensitive mask_path fails bad_request with zero fetch", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "kenari-mask-"));
+    try {
+      const img = path.join(dir, "photo.png");
+      writeFileSync(img, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      let fetched = false;
+      const impl = (async () => {
+        fetched = true;
+        throw new Error("should not fetch");
+      }) as typeof fetch;
+      const res = await invoke(
+        "edit_image",
+        { model: "gpt-image-2", prompt: "x", image_path: img, mask_path: "C:\\proj\\.env" },
+        { env: baseEnv(), fetchImpl: impl },
+      );
+      assert.equal(res.isError, true, JSON.stringify(res));
+      assert.equal(res.structuredContent!.code, "bad_request");
+      assert.match(String(res.content[0].text), /refused to read likely sensitive file/);
+      assert.equal(fetched, false, "no HTTP call may be made for blocked mask paths");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

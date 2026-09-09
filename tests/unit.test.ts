@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   parseBodyText,
@@ -8,12 +9,15 @@ import {
   toKenariError,
   parseRetryAfterMs,
   postJson,
+  getBytes,
+  hostMatches,
   KenariError,
 } from "../src/kenari/client.js";
 import {
   isImageModel,
   isVideoGenModel,
   imageCostIdr,
+  videoCostIdr,
   filterModels,
   type KenariModel,
 } from "../src/kenari/catalog.js";
@@ -24,6 +28,8 @@ import {
   isHttpsUrl,
   isLocalPath,
   looksLikeJobId,
+  isSensitiveFilePath,
+  fileFromPath,
 } from "../src/media/video.js";
 import { redact } from "../src/config.js";
 
@@ -131,6 +137,57 @@ describe("source classifiers", () => {
   it("job ids", () => {
     assert.equal(looksLikeJobId("job_abc123"), true);
     assert.equal(looksLikeJobId("https://x/y"), false);
+  });
+});
+
+describe("sensitive file blocklist (edit_image reads)", () => {
+  it("flags .env files (basename or *.env)", () => {
+    assert.equal(isSensitiveFilePath("C:\\proj\\.env"), true);
+    assert.equal(isSensitiveFilePath("C:\\proj\\prod.env"), true);
+    assert.equal(isSensitiveFilePath(".env"), true);
+    assert.equal(isSensitiveFilePath("/srv/app/.env.production"), true);
+    assert.equal(isSensitiveFilePath("C:\\proj\\app.png"), false);
+  });
+  it("flags private keys", () => {
+    assert.equal(isSensitiveFilePath("C:\\keys\\server.pem"), true);
+    assert.equal(isSensitiveFilePath("C:\\keys\\server.key"), true);
+    assert.equal(isSensitiveFilePath("/home/u/.ssh/id_rsa"), true);
+    assert.equal(isSensitiveFilePath("/home/u/.ssh/id_ed25519"), true);
+    assert.equal(isSensitiveFilePath("C:\\keys\\id_rsa.bak"), true);
+    assert.equal(isSensitiveFilePath("C:\\keys\\mykeyfile.png"), false);
+  });
+  it("flags cloud credential directories", () => {
+    assert.equal(isSensitiveFilePath("C:\\Users\\u\\.aws\\credentials"), true);
+    assert.equal(isSensitiveFilePath("/home/u/.ssh/known_hosts"), true);
+    assert.equal(isSensitiveFilePath("/home/u/.gcloud/credentials.db"), true);
+    assert.equal(isSensitiveFilePath("C:\\Users\\u\\pics\\cat.png"), false);
+  });
+  it("fileFromPath rejects blocked paths without touching the filesystem", async () => {
+    // These paths do not exist on disk; if the guard did not fire first,
+    // readFile would reject with ENOENT instead of our blocklist error.
+    for (const p of ["C:\\proj\\.env", "/home/u/.ssh/id_rsa", "C:\\keys\\a.pem"]) {
+      await assert.rejects(
+        fileFromPath(p),
+        (e: unknown) => {
+          assert.ok(e instanceof Error);
+          assert.match(e.message, /refused to read likely sensitive file/);
+          assert.doesNotMatch(e.message, /ENOENT/);
+          return true;
+        },
+      );
+    }
+  });
+  it("fileFromPath still reads a normal image file", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "kenari-sens-"));
+    try {
+      const img = path.join(dir, "photo.png");
+      writeFileSync(img, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      const f = await fileFromPath(img);
+      assert.equal(f.name, "photo.png");
+      assert.equal(f.type, "image/png");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -302,5 +359,107 @@ describe("no console.log in src", () => {
       const text = readFileSync(new URL(f, srcDir), "utf8");
       assert.ok(!/console\.log/.test(text), `console.log found in src/${f}`);
     }
+  });
+});
+
+describe("hostMatches (auth host-gate)", () => {
+  it("same host matches regardless of port/scheme/case", () => {
+    assert.equal(hostMatches("https://kenari.id/v1/x.mp4", "https://kenari.id/v1"), true);
+    assert.equal(hostMatches("https://KENARI.ID/a", "https://kenari.id/v1"), true);
+    assert.equal(hostMatches("https://kenari.id:8443/a", "http://kenari.id/v1"), true);
+    assert.equal(hostMatches("https://localhost:3000/a", "https://localhost:9999/v1"), true);
+  });
+  it("different host does not match", () => {
+    assert.equal(hostMatches("https://cdn.example.com/a.mp4", "https://kenari.id/v1"), false);
+    assert.equal(hostMatches("https://evil-kenari.id/a", "https://kenari.id/v1"), false);
+  });
+  it("garbage/missing urls do not match", () => {
+    assert.equal(hostMatches("not a url", "https://kenari.id/v1"), false);
+    assert.equal(hostMatches(undefined, "https://kenari.id/v1"), false);
+    assert.equal(hostMatches("https://kenari.id/v1", undefined), false);
+  });
+});
+
+describe("getBytes auth host-gate", () => {
+  const API = "https://kenari.id/v1";
+  const headersOf = (init?: RequestInit): Record<string, string> =>
+    (init?.headers ?? {}) as Record<string, string>;
+
+  it("sends Bearer when target host matches baseUrl host", async () => {
+    const inits: Array<RequestInit | undefined> = [];
+    const impl = (async (url: unknown, init?: RequestInit) => {
+      inits.push(init);
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "video/mp4" } });
+    }) as typeof fetch;
+    await getBytes(`${API}/videos/v1/content`, { fetchImpl: impl, apiKey: "kn-secret", baseUrl: API });
+    assert.equal(headersOf(inits[0]).Authorization, "Bearer kn-secret");
+  });
+  it("does NOT send Bearer to a third-party CDN host", async () => {
+    const inits: Array<RequestInit | undefined> = [];
+    const impl = (async (url: unknown, init?: RequestInit) => {
+      inits.push(init);
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "video/mp4" } });
+    }) as typeof fetch;
+    await getBytes("https://cdn.example.com/x.mp4", { fetchImpl: impl, apiKey: "kn-secret", baseUrl: API });
+    assert.equal(headersOf(inits[0]).Authorization, undefined);
+  });
+  it("still fetches with empty headers when no key configured", async () => {
+    const inits: Array<RequestInit | undefined> = [];
+    const impl = (async (_url: unknown, init?: RequestInit) => {
+      inits.push(init);
+      return new Response(new Uint8Array([1]), { status: 200, headers: { "content-type": "video/mp4" } });
+    }) as typeof fetch;
+    await getBytes(`${API}/videos/v1/content`, { fetchImpl: impl, baseUrl: API });
+    assert.equal(headersOf(inits[0]).Authorization, undefined);
+  });
+  it("CDN 401 surfaces as upstream_error, not unauthorized", async () => {
+    const impl = (async () => new Response("Forbidden", { status: 401 })) as typeof fetch;
+    await assert.rejects(
+      getBytes("https://cdn.example.com/x.mp4", { fetchImpl: impl, apiKey: "kn-secret", baseUrl: API }),
+      (e: unknown) => {
+        assert.ok(e instanceof KenariError);
+        assert.equal(e.code, "upstream_error", "unauthenticated CDN 401 must not read as key failure");
+        return true;
+      },
+    );
+  });
+  it("API-origin 401 still surfaces as unauthorized", async () => {
+    const impl = (async () => new Response("Unauthorized", { status: 401 })) as typeof fetch;
+    await assert.rejects(
+      getBytes(`${API}/videos/v1/content`, { fetchImpl: impl, apiKey: "kn-secret", baseUrl: API }),
+      (e: unknown) => {
+        assert.ok(e instanceof KenariError);
+        assert.equal(e.code, "unauthorized");
+        return true;
+      },
+    );
+  });
+});
+
+describe("videoCostIdr", () => {
+  it("undefined when no output_video pricing line (fail-open posture)", () => {
+    assert.equal(videoCostIdr({ id: "m" }), undefined);
+    assert.equal(videoCostIdr(FIXTURE.data.find((m) => m.id === "gpt-image-2")!), undefined);
+  });
+  it("parses per-second pricing", () => {
+    const m: KenariModel = {
+      id: "video-x",
+      pricing_lines: [{ billable: "output_video", unit: "second", micro_idr: 50_000_000, variant: null }],
+    };
+    assert.deepEqual(videoCostIdr(m), { perSecond: 50 });
+  });
+  it("parses flat per-call pricing", () => {
+    const m: KenariModel = {
+      id: "video-y",
+      pricing_lines: [{ billable: "output_video", unit: "call", micro_idr: 10_000_000, variant: null }],
+    };
+    assert.deepEqual(videoCostIdr(m), { flatPerCall: 10 });
+  });
+  it("ignores chat token lines even when other fields collide", () => {
+    const m: KenariModel = {
+      id: "chat-z",
+      pricing_lines: [{ billable: "output", unit: "token_1m", micro_idr: 1, variant: null }],
+    };
+    assert.equal(videoCostIdr(m), undefined);
   });
 });

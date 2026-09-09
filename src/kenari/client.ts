@@ -36,7 +36,7 @@ export class KenariError extends Error {
 }
 
 export type FetchImpl = typeof fetch;
-export type ErrorContext = "models" | "image" | "edit" | "video";
+export type ErrorContext = "models" | "image" | "edit" | "video" | "cdn";
 
 /**
  * Parse a response body. Kenari's 401 is PLAIN TEXT and image POSTs may be
@@ -66,7 +66,9 @@ export function classifyError(
   context: ErrorContext,
 ): KenariErrorCode {
   const lower = (bodyText ?? "").toLowerCase();
-  if (status === 401) return "unauthorized";
+  // CDN-context 401 means the (unauthenticated) CDN rejected us — NOT a key
+  // failure. Only API-origin 401 maps to "unauthorized".
+  if (status === 401) return context === "cdn" ? "upstream_error" : "unauthorized";
   if (
     status === 402 ||
     lower.includes("insufficient_balance") ||
@@ -177,6 +179,21 @@ export function parseRetryAfterMs(value: string | null): number {
 
 export function authHeaders(cfg: KenariConfig): Record<string, string> {
   return cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {};
+}
+
+/**
+ * True when `target` and `base` share the exact hostname (case-insensitive,
+ * port-agnostic — so self-hosted bases with ports keep working). False when
+ * either URL is missing or unparseable. Used to gate Bearer auth to the
+ * configured Kenari origin only.
+ */
+export function hostMatches(target: string | undefined, base: string | undefined): boolean {
+  if (!target || !base) return false;
+  try {
+    return new URL(target).hostname.toLowerCase() === new URL(base).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 export interface OkBody {
@@ -343,15 +360,22 @@ export async function postMultipart(
 /** GET bytes (video content download, or image URLs returned by the API). */
 export async function getBytes(
   url: string,
-  opts: { fetchImpl?: FetchImpl; apiKey?: string; timeoutMs?: number } = {},
+  opts: { fetchImpl?: FetchImpl; apiKey?: string; baseUrl?: string; timeoutMs?: number } = {},
 ): Promise<{ bytes: Uint8Array; contentType: string | null }> {
   const f = opts.fetchImpl ?? fetch;
   const signal = opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined;
+  // Host gate: attach the Bearer key ONLY when the target URL host matches the
+  // configured Kenari base URL host. Third-party CDN URLs (returned by the API)
+  // are fetched unauthenticated so the key never leaves the Kenari origin.
+  // CDN non-2xx is reclassified as upstream/CDN error — never "unauthorized".
+  const isApiOrigin = hostMatches(url, opts.baseUrl);
+  const headers: Record<string, string> =
+    opts.apiKey && isApiOrigin ? { Authorization: `Bearer ${opts.apiKey}` } : {};
   let res: Response;
   try {
     res = await f(url, {
       method: "GET",
-      headers: opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {},
+      headers,
       signal,
     });
   } catch (e) {
@@ -365,7 +389,7 @@ export async function getBytes(
     try {
       res = await f(url, {
         method: "GET",
-        headers: opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {},
+        headers,
         signal,
       });
     } catch (e) {
@@ -374,7 +398,8 @@ export async function getBytes(
   }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw toKenariError(res.status, text, "video", retryAfterForFinal(res.status, res.headers.get("retry-after"), retryAfterMs));
+    const context: ErrorContext = isApiOrigin ? "video" : "cdn";
+    throw toKenariError(res.status, text, context, retryAfterForFinal(res.status, res.headers.get("retry-after"), retryAfterMs));
   }
   const buf = new Uint8Array(await res.arrayBuffer());
   return { bytes: buf, contentType: res.headers.get("content-type") };

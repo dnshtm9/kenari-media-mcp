@@ -41,7 +41,7 @@ The build writes the server entry to `dist/index.js` (the `bin` is `kenari-media
 | `KENARI_ALLOW_VIDEO` | allow | Set to `0`/`false` to disable all video tools with a clear error. |
 | `KENARI_MAX_IMAGE_N` | `4` | Preflight cap for `n`. |
 | `KENARI_MAX_VIDEO_DURATION` | `15` | Preflight cap for `duration` (seconds). |
-| `KENARI_MAX_COST_IDR_PER_CALL` | (none) | Optional per-call IDR ceiling (image tools; best-effort catalog lookup). |
+| `KENARI_MAX_COST_IDR_PER_CALL` | (none) | Optional per-call IDR ceiling for **image and video** tools (best-effort catalog lookup; fail-open when the price is unknown). |
 
 ### `.env` files — important caveat
 
@@ -138,8 +138,8 @@ Until then, use the local `node` + absolute-path config above.
 1. `list_media_models { modality?: "image"|"video" }` — public catalog with per-image IDR costs. Snapshot example: 5 image models, 0 video-generation models (the video list may be `[]` — video tools are still implemented and pass through to the API).
 2. `generate_image { model, prompt, n?, size?, background?: transparent|opaque|auto, preview?=false }` — text-to-image; `n` capped by `KENARI_MAX_IMAGE_N`.
 3. `edit_image { model, prompt, image_path, mask_path?, n?, size?, background?: opaque|auto }` — reads local image files you pass; `background: transparent` is rejected by schema.
-4. `create_video { model, prompt, duration?, resolution?, image_url?, end_image_url?, input_images?, video_url?, aspect_ratio? }` — text/image-to-video; `duration` capped by `KENARI_MAX_VIDEO_DURATION`.
-5. `extend_video { model, source, prompt?, duration? }` — `source` is a job id or an https URL; local file paths are rejected before any HTTP request.
+4. `create_video { model, prompt, duration?, resolution?, image_url?, end_image_url?, input_images?, video_url?, aspect_ratio? }` — text/image-to-video; `duration` capped by `KENARI_MAX_VIDEO_DURATION`; also honors `KENARI_MAX_COST_IDR_PER_CALL` (per-call preflight estimate, see "Cost caps" below).
+5. `extend_video { model, source, prompt?, duration? }` — `source` is a job id or an https URL; local file paths are rejected before any HTTP request. Also honors `KENARI_MAX_COST_IDR_PER_CALL` like `create_video`.
 6. `get_video_status { id }` — checks a video job; auto-downloads the result when done.
 7. `wait_for_video { id, timeout_ms?=1200000, download?=true }` — polls every 5s with backoff capped at 15s; emits `notifications/progress` when the client sends a progress token. On timeout it returns `still_rendering` with `isError: false` so the agent can retry later.
 8. `download_video { id }` — downloads a finished video; returns a `still_rendering` error while rendering.
@@ -152,6 +152,18 @@ Error codes surfaced in `structuredContent`: `unauthorized | insufficient_balanc
 - Kenari image POSTs may stream ASCII-space "heartbeat" characters (~every 20s) before the JSON body — the server reads the full body, trims, then parses.
 - HTTP timeout: 300s for image calls. `wait_for_video` default budget: 20 minutes.
 - stdout carries JSON-RPC only; all logs go to stderr (`console.error`).
+
+### Cost caps — per-call, fail-open, no accumulation
+
+`KENARI_MAX_COST_IDR_PER_CALL` applies to `generate_image`, `edit_image`, `create_video`, and `extend_video` as a **per-call preflight estimate**, checked against the live catalog (`list_media_models` pricing) **before any paid POST** is made. Three fail-open paths, deliberately identical for images and video:
+
+1. the env var is unset,
+2. the catalog lookup itself fails, or
+3. the model has no parseable price line.
+
+In those cases the call proceeds and a warning is written to stderr. **Video pricing calibration:** no video-generation model has appeared in Kenari's catalog yet (`pricing_lines` with `billable: "output_video"` and a `second`/`video`/`call` unit). Once one appears, per-second prices are multiplied by `duration` (falling back to `KENARI_MAX_VIDEO_DURATION` when unset) and flat per-call prices are used as-is — no code change expected, but re-verify the estimate against the live catalog then.
+
+There is **no cross-call accounting**: nothing accumulates spend across calls or sessions. An in-memory ledger was considered and intentionally deferred — it would reset on every server restart, producing dishonest numbers. If you need a hard budget, set the cap and monitor your Kenari dashboard.
 
 ## Manual live smoke test
 
@@ -176,9 +188,10 @@ Tests mock `fetch` entirely, so running them costs nothing and requires no API k
 ## Security notes
 
 - `kn-*` API key values are redacted in logs.
+- The `Authorization: Bearer` header is attached **only** to requests whose host matches `KENARI_BASE_URL`'s host (exact host match, port-agnostic, so self-hosted bases keep working). CDN URLs returned by the API (content/image downloads) are fetched unauthenticated, and a CDN-side 401 is reported as `upstream_error` — never as an API-key failure.
 - Never commit API keys (`.env`, shell history, config dumps).
-- `edit_image` reads local files **you** pass to it — only pass files you intend to upload.
-- Generation costs money on every call; beware of an agent looping on generation tools and burning IDR unattended.
+- `edit_image` reads local files **you** pass to it — only pass files you intend to upload. Obvious sensitive files are refused before reading: `.env` / `*.env` (incl. `.env.*`), private keys (`.pem`, `.key`, `id_rsa`/`id_ed25519`-style names), and paths under `.ssh`, `.aws`, or `.gcloud` directories. The blocklist is a guardrail, not a sandbox — do not point the tool at directories you do not control.
+- Generation costs money on every call; beware of an agent looping on generation tools and burning IDR unattended (see "Cost caps" above).
 
 ## License
 

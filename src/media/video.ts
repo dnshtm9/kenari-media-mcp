@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 export type VideoStatusName = "queued" | "rendering" | "done" | "failed" | "expired";
 
@@ -107,8 +108,31 @@ export function mimeForFilename(filename: string): string {
   return "image/png";
 }
 
+/**
+ * True when the path's basename is an obvious sensitive file: .env files,
+ * private keys (.pem/.key, id_rsa and id_ed25519 keys). Cloud-credential
+ * directories (e.g. ~/.aws, ~/.ssh) count too. Case-insensitive on the
+ * basename.
+ */
+export function isSensitiveFilePath(pathValue: string): boolean {
+  const base = path.basename(String(pathValue ?? "")).toLowerCase();
+  if (!base) return false;
+  if (base === ".env" || base.startsWith(".env.") || base.endsWith(".env")) return true;
+  if (base.endsWith(".pem") || base.endsWith(".key")) return true;
+  if (/^(id_rsa|id_ed25519|id_ecdsa|id_dsa)([.\-_].*)?$/.test(base)) return true;
+  const parts = String(pathValue ?? "")
+    .split(/[\\/]+/)
+    .map((p) => p.toLowerCase());
+  return parts.includes(".ssh") || parts.includes(".aws") || parts.includes(".gcloud");
+}
+
 /** Read a local image file into a File for multipart upload. */
 export async function fileFromPath(pathValue: string): Promise<File> {
+  if (isSensitiveFilePath(pathValue)) {
+    throw new Error(
+      `refused to read likely sensitive file (env/credential/private key): ${pathValue}`,
+    );
+  }
   const bytes = await readFile(pathValue);
   const filename = pathValue.split(/[\\/]/).pop() || "image";
   return new File([bytes], filename, { type: mimeForFilename(filename) });
