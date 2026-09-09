@@ -31,7 +31,8 @@ import {
   isSensitiveFilePath,
   fileFromPath,
 } from "../src/media/video.js";
-import { redact } from "../src/config.js";
+import { redact, getConfig } from "../src/config.js";
+import { errFromKenari } from "../src/server.js";
 
 const FIXTURE = JSON.parse(
   readFileSync(new URL("./fixtures/models.json", import.meta.url), "utf8"),
@@ -188,6 +189,135 @@ describe("sensitive file blocklist (edit_image reads)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("errFromKenari error text", () => {
+  it("does not double the code prefix in the message", () => {
+    const e = toKenariError(401, "Unauthorized", "models");
+    const res = errFromKenari(e, "list_media_models") as {
+      content: Array<{ text: string }>;
+      structuredContent: Record<string, unknown>;
+    };
+    assert.match(res.content[0].text, /^unauthorized: /);
+    assert.ok(
+      !/unauthorized: unauthorized/.test(res.content[0].text),
+      `doubled prefix: ${res.content[0].text}`,
+    );
+    assert.equal(res.structuredContent.code, "unauthorized");
+  });
+});
+
+describe("errFromKenari surfaces retryAfterMs", () => {
+  it("persistent 429 error carries retryAfterMs + wait hint in text", () => {
+    const e = toKenariError(429, "rate limited", "image", 2000);
+    const res = errFromKenari(e, "generate_image") as {
+      content: Array<{ text: string }>;
+      structuredContent: Record<string, unknown>;
+    };
+    assert.equal(res.structuredContent.retryAfterMs, 2000);
+    assert.match(String(res.content[0].text), /retry after 2000 ms/);
+  });
+  it("non-429 error has no retryAfterMs and no wait hint", () => {
+    const e = toKenariError(500, "boom", "image");
+    const res = errFromKenari(e, "generate_image") as {
+      content: Array<{ text: string }>;
+      structuredContent: Record<string, unknown>;
+    };
+    assert.equal(res.structuredContent.retryAfterMs, undefined);
+    assert.doesNotMatch(String(res.content[0].text), /retry after/);
+  });
+});
+
+describe("negative/zero env clamps", () => {
+  it("negative KENARI_MAX_IMAGE_N falls back to default 4 with warning", () => {
+    const warnings: string[] = [];
+    const origErr = console.error;
+    console.error = (m: unknown) => {
+      warnings.push(String(m));
+    };
+    try {
+      const cfg = getConfig({ KENARI_MAX_IMAGE_N: "-3" } as NodeJS.ProcessEnv);
+      assert.equal(cfg.maxImageN, 4);
+    } finally {
+      console.error = origErr;
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /KENARI_MAX_IMAGE_N.*not a positive integer/);
+  });
+  it("KENARI_MAX_IMAGE_N=0 uniformly means default (not falsy accident)", () => {
+    const warnings: string[] = [];
+    const origErr = console.error;
+    console.error = (m: unknown) => {
+      warnings.push(String(m));
+    };
+    try {
+      const cfg = getConfig({ KENARI_MAX_IMAGE_N: "0" } as NodeJS.ProcessEnv);
+      assert.equal(cfg.maxImageN, 4);
+    } finally {
+      console.error = origErr;
+    }
+    assert.equal(warnings.length, 1);
+  });
+  it("negative KENARI_MAX_VIDEO_DURATION falls back to default 15", () => {
+    const warnings: string[] = [];
+    const origErr = console.error;
+    console.error = (m: unknown) => {
+      warnings.push(String(m));
+    };
+    try {
+      const cfg = getConfig({ KENARI_MAX_VIDEO_DURATION: "-30" } as NodeJS.ProcessEnv);
+      assert.equal(cfg.maxVideoDuration, 15);
+    } finally {
+      console.error = origErr;
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /KENARI_MAX_VIDEO_DURATION/);
+  });
+  it("negative KENARI_MAX_COST_IDR_PER_CALL -> undefined (no cap), not lockout", () => {
+    const warnings: string[] = [];
+    const origErr = console.error;
+    console.error = (m: unknown) => {
+      warnings.push(String(m));
+    };
+    try {
+      const cfg = getConfig({ KENARI_MAX_COST_IDR_PER_CALL: "-100" } as NodeJS.ProcessEnv);
+      assert.equal(cfg.maxCostIdrPerCall, undefined);
+    } finally {
+      console.error = origErr;
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /KENARI_MAX_COST_IDR_PER_CALL/);
+  });
+  it("KENARI_MAX_COST_IDR_PER_CALL=0 -> undefined (uniform non-positive = unset)", () => {
+    const warnings: string[] = [];
+    const origErr = console.error;
+    console.error = (m: unknown) => {
+      warnings.push(String(m));
+    };
+    try {
+      const cfg = getConfig({ KENARI_MAX_COST_IDR_PER_CALL: "0" } as NodeJS.ProcessEnv);
+      assert.equal(cfg.maxCostIdrPerCall, undefined);
+    } finally {
+      console.error = origErr;
+    }
+    assert.equal(warnings.length, 1);
+  });
+  it("unset env vars take defaults with no warning", () => {
+    const warnings: string[] = [];
+    const origErr = console.error;
+    console.error = (m: unknown) => {
+      warnings.push(String(m));
+    };
+    try {
+      const cfg = getConfig({} as NodeJS.ProcessEnv);
+      assert.equal(cfg.maxImageN, 4);
+      assert.equal(cfg.maxVideoDuration, 15);
+      assert.equal(cfg.maxCostIdrPerCall, undefined);
+    } finally {
+      console.error = origErr;
+    }
+    assert.equal(warnings.length, 0);
   });
 });
 

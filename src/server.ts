@@ -74,11 +74,19 @@ export function err(
 
 export function errFromKenari(e: unknown, fallbackOp: string) {
   if (e instanceof KenariError) {
-    return err(`${e.code}: ${e.message}`, {
+    // e.message already carries the `code: ` prefix (baked in by
+    // toKenariError/networkError) — do NOT prepend e.code again (doubling).
+    const structured: Record<string, unknown> = {
       code: e.code,
       status: e.status,
       op: fallbackOp,
-    });
+    };
+    // Surface Retry-After (present only on a final 429) — optional field
+    // pattern like `hint`; looseObject outputs tolerate extra keys.
+    const waitHint =
+      e.retryAfterMs !== undefined ? ` (retry after ${e.retryAfterMs} ms)` : "";
+    if (e.retryAfterMs !== undefined) structured.retryAfterMs = e.retryAfterMs;
+    return err(`${e.message}${waitHint}`, structured);
   }
   const msg = e instanceof Error ? e.message : String(e);
   return err(`upstream_error: ${msg}`, { code: "upstream_error", op: fallbackOp });

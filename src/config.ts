@@ -46,11 +46,46 @@ export interface KenariConfig {
 
 const VIDEO_DISABLED = new Set(["0", "false", "no", "off"]);
 
+/**
+ * Parse a non-negative integer env var. Unset/garbage/zero/negative all mean
+ * "not set" -> default. Warns (stderr) when a value was provided but is not a
+ * positive integer (negatives and 0 previously locked out tools or behaved
+ * inconsistently). No throw: config is re-read lazily per call and the
+ * codebase is fail-open.
+ */
+function clampPositiveInt(
+  raw: string | undefined,
+  fallback: number,
+  label: string,
+): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(
+      `[kenari-media-mcp] config: ${label}="${raw}" is not a positive integer; using default ${fallback}.`,
+    );
+    return fallback;
+  }
+  return n;
+}
+
 export function getConfig(env: NodeJS.ProcessEnv = process.env): KenariConfig {
   const allowRaw = env.KENARI_ALLOW_VIDEO;
+  const maxImageN = clampPositiveInt(env.KENARI_MAX_IMAGE_N, 4, "KENARI_MAX_IMAGE_N");
+  const maxVideoDuration = clampPositiveInt(env.KENARI_MAX_VIDEO_DURATION, 15, "KENARI_MAX_VIDEO_DURATION");
   const maxCostRaw = env.KENARI_MAX_COST_IDR_PER_CALL;
-  const maxCostParsed =
-    maxCostRaw !== undefined && maxCostRaw !== "" ? Number.parseInt(maxCostRaw, 10) : NaN;
+  // KENARI_MAX_COST_IDR_PER_CALL is optional (absent = no cap); when set it
+  // must be a positive integer — non-positive values fall back to "unset"
+  // (fail-open) with a warning instead of silently blocking every tool call.
+  let maxCostIdrPerCall: number | undefined;
+  if (maxCostRaw !== undefined && maxCostRaw !== "") {
+    const n = Number.parseInt(maxCostRaw, 10);
+    if (Number.isFinite(n) && n > 0) maxCostIdrPerCall = n;
+    else
+      console.error(
+        `[kenari-media-mcp] config: KENARI_MAX_COST_IDR_PER_CALL="${maxCostRaw}" is not a positive integer; ignoring (no cost cap).`,
+      );
+  }
   return {
     baseUrl: (env.KENARI_BASE_URL ?? "https://kenari.id/v1").replace(/\/+$/, ""),
     apiKey: env.KENARI_API_KEY || undefined,
@@ -59,9 +94,9 @@ export function getConfig(env: NodeJS.ProcessEnv = process.env): KenariConfig {
       allowRaw === undefined || allowRaw === ""
         ? true
         : !VIDEO_DISABLED.has(allowRaw.toLowerCase()),
-    maxImageN: Number.parseInt(env.KENARI_MAX_IMAGE_N ?? "4", 10) || 4,
-    maxVideoDuration: Number.parseInt(env.KENARI_MAX_VIDEO_DURATION ?? "15", 10) || 15,
-    maxCostIdrPerCall: Number.isFinite(maxCostParsed) ? maxCostParsed : undefined,
+    maxImageN,
+    maxVideoDuration,
+    maxCostIdrPerCall,
     imageTimeoutMs: 300_000,
   };
 }
