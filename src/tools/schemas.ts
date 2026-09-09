@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isHttpsUrl, isLocalPath } from "../media/video.js";
 
 /* ------------------------------------------------------------------ */
 /* Input schemas — every field described for the LLM.                 */
@@ -131,7 +132,35 @@ export const createVideoSchema = z.object({
     .string()
     .optional()
     .describe("Aspect ratio, e.g. '16:9' or '9:16'. Optional and model-dependent."),
-});
+})
+  // image_url/end_image_url/input_images accept https:// or data: (documented
+  // behavior); video_url must be https://. http://, file://, bare/relative
+  // paths and other schemes are rejected at validation time.
+  .superRefine((data, ctx) => {
+    const check = (field: "image_url" | "end_image_url" | "video_url", value: string | undefined, allowData: boolean) => {
+      if (value === undefined) return;
+      if (isHttpsUrl(value)) return;
+      if (allowData && /^data:/i.test(value)) return;
+      ctx.addIssue({
+        code: "custom",
+        path: [field],
+        message: `${field} must be an https:// URL${allowData ? " or a data: image URL" : ""} — http://, file:// and local paths are not accepted.`,
+      });
+    };
+    check("image_url", data.image_url, true);
+    check("end_image_url", data.end_image_url, true);
+    check("video_url", data.video_url, false);
+    if (data.input_images !== undefined) {
+      data.input_images.forEach((u, i) => {
+        if (isHttpsUrl(u) || /^data:/i.test(u)) return;
+        ctx.addIssue({
+          code: "custom",
+          path: ["input_images", i],
+          message: "input_images entries must be https:// or data: image URLs — http://, file:// and local paths are not accepted.",
+        });
+      });
+    }
+  });
 
 export const extendVideoSchema = z.object({
   model: z
@@ -165,9 +194,10 @@ export const waitForVideoSchema = z.object({
     .number()
     .int()
     .min(1000)
+    .max(3_600_000)
     .default(1_200_000)
     .describe(
-      "Maximum time to keep polling in milliseconds (>= 1000). Defaults to 1200000 (20 min). On timeout returns still_rendering (not an error) — call again.",
+      "Maximum time to keep polling in milliseconds (1000–3600000). Defaults to 1200000 (20 min). On timeout returns still_rendering (not an error) — call again.",
     ),
   download: z
     .boolean()

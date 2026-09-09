@@ -76,6 +76,13 @@ export function isHttpUrl(value: string): boolean {
   return /^(https?):\/\//i.test(v);
 }
 
+/** True ONLY for https:// URLs — http://, file://, data: and paths are all false. */
+export function isHttpsUrl(value: string): boolean {
+  const v = String(value ?? "").trim();
+  if (/^[a-zA-Z]:[\\/]/.test(v)) return false;
+  return /^https:\/\//i.test(v);
+}
+
 /** True when the value looks like a local filesystem path (win/unix absolute or relative). */
 export function isLocalPath(value: string): boolean {
   const v = String(value ?? "").trim();

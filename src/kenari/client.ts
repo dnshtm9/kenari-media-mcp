@@ -16,13 +16,22 @@ export class KenariError extends Error {
   code: KenariErrorCode;
   status: number;
   body: string;
+  /** Parsed Retry-After value (ms, capped) when the error was an HTTP 429. */
+  retryAfterMs?: number;
 
-  constructor(code: KenariErrorCode, message: string, status: number, body: string) {
+  constructor(
+    code: KenariErrorCode,
+    message: string,
+    status: number,
+    body: string,
+    retryAfterMs?: number,
+  ) {
     super(message);
     this.name = "KenariError";
     this.code = code;
     this.status = status;
     this.body = body;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -121,9 +130,49 @@ export function toKenariError(
   status: number,
   bodyText: string,
   context: ErrorContext,
+  retryAfterMs?: number,
 ): KenariError {
   const code = classifyError(status, bodyText, context);
-  return new KenariError(code, `${code}: ${redact(extractMessage(bodyText))}`, status, bodyText);
+  return new KenariError(code, `${code}: ${redact(extractMessage(bodyText))}`, status, bodyText, retryAfterMs);
+}
+
+/**
+ * Retry-After scoping: only a final HTTP 429 may carry retryAfterMs. A retry
+ * that failed with a different status must NOT inherit the first 429's value;
+ * a retried 429 uses its own Retry-After header when present.
+ */
+function retryAfterForFinal(
+  finalStatus: number,
+  finalHeader: string | null,
+  firstAttemptMs: number | undefined,
+): number | undefined {
+  if (finalStatus !== 429) return undefined;
+  return finalHeader !== null ? parseRetryAfterMs(finalHeader) : firstAttemptMs;
+}
+
+/**
+ * Parse the Retry-After header (seconds or HTTP-date) into a wait duration in
+ * ms, capped at MAX_RETRY_AFTER_MS (30s). Returns DEFAULT_RETRY_AFTER_MS
+ * (1000ms) when the header is missing or unparseable.
+ */
+export const MAX_RETRY_AFTER_MS = 30_000;
+export const DEFAULT_RETRY_AFTER_MS = 1_000;
+
+export function parseRetryAfterMs(value: string | null): number {
+  if (!value) return DEFAULT_RETRY_AFTER_MS;
+  const trimmed = value.trim();
+  if (!trimmed) return DEFAULT_RETRY_AFTER_MS;
+  if (/^\d+$/.test(trimmed)) {
+    const secs = Number.parseInt(trimmed, 10);
+    return Math.min(secs > 0 ? secs * 1000 : DEFAULT_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS);
+  }
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) {
+    const delta = dateMs - Date.now();
+    if (delta > 0) return Math.min(delta, MAX_RETRY_AFTER_MS);
+    return DEFAULT_RETRY_AFTER_MS;
+  }
+  return DEFAULT_RETRY_AFTER_MS;
 }
 
 export function authHeaders(cfg: KenariConfig): Record<string, string> {
@@ -151,6 +200,28 @@ function networkError(path: string, e: unknown): KenariError {
   return new KenariError("upstream_error", `upstream_error: ${redact(msg)}`, 0, "");
 }
 
+/**
+ * Sleep for the 429 Retry-After wait. Honors the request signal so an
+ * expiring AbortSignal.timeout aborts the wait instead of extending it.
+ */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error("Aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("Aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function postJson(
   path: string,
   cfg: KenariConfig,
@@ -158,10 +229,11 @@ export async function postJson(
   opts: CallOpts,
 ): Promise<OkBody> {
   const f = opts.fetchImpl ?? fetch;
+  const url = cfg.baseUrl + path;
   const signal = opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined;
   let res: Response;
   try {
-    res = await f(cfg.baseUrl + path, {
+    res = await f(url, {
       method: "POST",
       headers: { ...authHeaders(cfg), "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -170,17 +242,34 @@ export async function postJson(
   } catch (e) {
     throw networkError(path, e);
   }
+  let retryAfterMs: number | undefined;
+  if (res.status === 429) {
+    retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+    await res.text().catch(() => ""); // drain body before retry
+    await sleepAbortable(retryAfterMs, signal);
+    try {
+      res = await f(url, {
+        method: "POST",
+        headers: { ...authHeaders(cfg), "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (e) {
+      throw networkError(path, e);
+    }
+  }
   const { text, parsed } = await readResponseBody(res);
-  if (!res.ok) throw toKenariError(res.status, text, opts.context);
+  if (!res.ok) throw toKenariError(res.status, text, opts.context, retryAfterForFinal(res.status, res.headers.get("retry-after"), retryAfterMs));
   return { status: res.status, text, parsed };
 }
 
 export async function getJson(path: string, cfg: KenariConfig, opts: CallOpts): Promise<OkBody> {
   const f = opts.fetchImpl ?? fetch;
+  const url = cfg.baseUrl + path;
   const signal = opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined;
   let res: Response;
   try {
-    res = await f(cfg.baseUrl + path, {
+    res = await f(url, {
       method: "GET",
       headers: { ...authHeaders(cfg) },
       signal,
@@ -188,8 +277,23 @@ export async function getJson(path: string, cfg: KenariConfig, opts: CallOpts): 
   } catch (e) {
     throw networkError(path, e);
   }
+  let retryAfterMs: number | undefined;
+  if (res.status === 429) {
+    retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+    await res.text().catch(() => ""); // drain body before retry
+    await sleepAbortable(retryAfterMs, signal);
+    try {
+      res = await f(url, {
+        method: "GET",
+        headers: { ...authHeaders(cfg) },
+        signal,
+      });
+    } catch (e) {
+      throw networkError(path, e);
+    }
+  }
   const { text, parsed } = await readResponseBody(res);
-  if (!res.ok) throw toKenariError(res.status, text, opts.context);
+  if (!res.ok) throw toKenariError(res.status, text, opts.context, retryAfterForFinal(res.status, res.headers.get("retry-after"), retryAfterMs));
   return { status: res.status, text, parsed };
 }
 
@@ -200,11 +304,12 @@ export async function postMultipart(
   opts: CallOpts,
 ): Promise<OkBody> {
   const f = opts.fetchImpl ?? fetch;
+  const url = cfg.baseUrl + path;
   const signal = opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined;
   let res: Response;
   try {
     // Do NOT set Content-Type manually — fetch sets the multipart boundary.
-    res = await f(cfg.baseUrl + path, {
+    res = await f(url, {
       method: "POST",
       headers: { ...authHeaders(cfg) },
       body: form,
@@ -213,8 +318,25 @@ export async function postMultipart(
   } catch (e) {
     throw networkError(path, e);
   }
+  let retryAfterMs: number | undefined;
+  if (res.status === 429) {
+    retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+    await res.text().catch(() => ""); // drain body before retry
+    await sleepAbortable(retryAfterMs, signal);
+    try {
+      // Do NOT set Content-Type manually — fetch sets the multipart boundary.
+      res = await f(url, {
+        method: "POST",
+        headers: { ...authHeaders(cfg) },
+        body: form,
+        signal,
+      });
+    } catch (e) {
+      throw networkError(path, e);
+    }
+  }
   const { text, parsed } = await readResponseBody(res);
-  if (!res.ok) throw toKenariError(res.status, text, opts.context);
+  if (!res.ok) throw toKenariError(res.status, text, opts.context, retryAfterForFinal(res.status, res.headers.get("retry-after"), retryAfterMs));
   return { status: res.status, text, parsed };
 }
 
@@ -235,9 +357,24 @@ export async function getBytes(
   } catch (e) {
     throw networkError(url, e);
   }
+  let retryAfterMs: number | undefined;
+  if (res.status === 429) {
+    retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+    await res.text().catch(() => ""); // drain body before retry
+    await sleepAbortable(retryAfterMs, signal);
+    try {
+      res = await f(url, {
+        method: "GET",
+        headers: opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {},
+        signal,
+      });
+    } catch (e) {
+      throw networkError(url, e);
+    }
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw toKenariError(res.status, text, "video");
+    throw toKenariError(res.status, text, "video", retryAfterForFinal(res.status, res.headers.get("retry-after"), retryAfterMs));
   }
   const buf = new Uint8Array(await res.arrayBuffer());
   return { bytes: buf, contentType: res.headers.get("content-type") };

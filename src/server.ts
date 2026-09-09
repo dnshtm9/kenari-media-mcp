@@ -21,10 +21,12 @@ import {
   bytesFromDataUrl,
   extFromContentType,
   saveBytes,
+  sniffExtFromBytes,
 } from "./media/files.js";
 import {
   fileFromPath,
   isHttpUrl,
+  isHttpsUrl,
   isLocalPath,
   normalizeVideoStatus,
 } from "./media/video.js";
@@ -114,6 +116,18 @@ export function getDepsFetch(deps: ServerDeps | undefined): FetchImpl | undefine
 const sleepDefault = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Pick the saved-file extension: magic-byte sniff wins over Content-Type,
+ * which wins over the caller's fallback.
+ */
+function pickExt(
+  bytes: Uint8Array,
+  contentType: string | null,
+  fallbackExt: string,
+): string {
+  return sniffExtFromBytes(bytes) ?? extFromContentType(contentType, fallbackExt);
+}
+
 /** Download a remote URL or decode a data: URL into saved files. Returns absolute paths. */
 async function saveFromUrlOrData(
   cfg: KenariConfig,
@@ -124,15 +138,17 @@ async function saveFromUrlOrData(
 ): Promise<{ paths: string[]; ext: string }> {
   const data = bytesFromDataUrl(url);
   if (data) {
-    const p = await saveBytes(cfg.outputDir, base, data.ext, data.bytes);
-    return { paths: [p], ext: data.ext };
+    const sniffed = sniffExtFromBytes(data.bytes);
+    const ext = sniffed ?? data.ext;
+    const p = await saveBytes(cfg.outputDir, base, ext, data.bytes);
+    return { paths: [p], ext };
   }
   const { bytes, contentType } = await getBytes(url, {
     fetchImpl,
     apiKey: cfg.apiKey,
     timeoutMs: cfg.imageTimeoutMs,
   });
-  const ext = extFromContentType(contentType, fallbackExt);
+  const ext = pickExt(bytes, contentType, fallbackExt);
   const p = await saveBytes(cfg.outputDir, base, ext, bytes);
   return { paths: [p], ext };
 }
@@ -359,6 +375,30 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           { code: "bad_request", op: "create_video" },
         );
       }
+      // Reject non-https (and non-data) I2V references BEFORE any HTTP call —
+      // mirrors extend_video's local-path reject. Defense in depth for the
+      // same rule enforced by createVideoSchema's superRefine.
+      const badRef = ((): string | null => {
+        if (args.image_url && !isHttpsUrl(args.image_url) && !/^data:/i.test(args.image_url)) {
+          return "image_url";
+        }
+        if (args.end_image_url && !isHttpsUrl(args.end_image_url) && !/^data:/i.test(args.end_image_url)) {
+          return "end_image_url";
+        }
+        if (args.video_url && !isHttpsUrl(args.video_url)) return "video_url";
+        if (args.input_images) {
+          for (const u of args.input_images) {
+            if (!isHttpsUrl(u) && !/^data:/i.test(u)) return "input_images";
+          }
+        }
+        return null;
+      })();
+      if (badRef) {
+        return err(
+          `bad_request: ${badRef} must be an https:// URL (or data: image URL) — http://, file:// and local paths are not accepted.`,
+          { code: "bad_request", op: "create_video" },
+        );
+      }
       const body: Record<string, unknown> = { model: args.model, prompt: args.prompt };
       for (const k of [
         "duration",
@@ -461,6 +501,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
       try {
         const { parsed } = await getJson(`/videos/${encodeURIComponent(args.id)}`, cfg, {
           context: "video",
+          timeoutMs: cfg.imageTimeoutMs,
           fetchImpl: getDepsFetch(deps),
         });
         return await statusResult(args.id, parsed, cfg, true, getDepsFetch(deps));
@@ -496,6 +537,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         try {
           ({ parsed } = await getJson(`/videos/${encodeURIComponent(args.id)}`, cfg, {
             context: "video",
+            timeoutMs: cfg.imageTimeoutMs,
             fetchImpl: getDepsFetch(deps),
           }));
         } catch (e) {
@@ -551,6 +593,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
       try {
         const { parsed } = await getJson(`/videos/${encodeURIComponent(args.id)}`, cfg, {
           context: "video",
+          timeoutMs: cfg.imageTimeoutMs,
           fetchImpl: getDepsFetch(deps),
         });
         const st = normalizeVideoStatus(parsed);
@@ -579,7 +622,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           `${cfg.baseUrl}/videos/${encodeURIComponent(args.id)}/content`,
           { fetchImpl: getDepsFetch(deps), apiKey: cfg.apiKey, timeoutMs: cfg.imageTimeoutMs },
         );
-        const ext = extFromContentType(contentType, ".mp4");
+        const ext = pickExt(bytes, contentType, ".mp4");
         const p = await saveBytes(cfg.outputDir, `video-${args.id}`, ext, bytes);
         return ok(`Video ${args.id} downloaded:\n- ${p}`, { id: args.id, paths: [p] });
       } catch (e) {
@@ -615,7 +658,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
     for (const b of b64s) {
       j += 1;
       const bytes = Buffer.from(b.replace(/\s+/g, ""), "base64");
-      const p = await saveBytes(cfg.outputDir, `img-${model}`, ".png", bytes);
+      const p = await saveBytes(cfg.outputDir, `img-${model}`, sniffExtFromBytes(bytes) ?? ".png", bytes);
       paths.push(p);
     }
     if (paths.length === 0) {
@@ -664,7 +707,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           `${cfg.baseUrl}/videos/${encodeURIComponent(id)}/content`,
           { fetchImpl, apiKey: cfg.apiKey, timeoutMs: cfg.imageTimeoutMs },
         );
-        const ext = extFromContentType(contentType, ".mp4");
+        const ext = pickExt(bytes, contentType, ".mp4");
         const p = await saveBytes(cfg.outputDir, `video-${id}`, ext, bytes);
         return ok(`Video ${id} done:\n- ${p}`, { ...base, code: "done", paths: [p] });
       } catch (e) {
@@ -688,6 +731,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
     try {
       const { parsed } = await getJson(`/videos/${encodeURIComponent(id)}`, cfg, {
         context: "video",
+        timeoutMs: cfg.imageTimeoutMs,
         fetchImpl,
       });
       const st = normalizeVideoStatus(parsed);

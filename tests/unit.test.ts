@@ -2,7 +2,14 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
-import { parseBodyText, classifyError, toKenariError } from "../src/kenari/client.js";
+import {
+  parseBodyText,
+  classifyError,
+  toKenariError,
+  parseRetryAfterMs,
+  postJson,
+  KenariError,
+} from "../src/kenari/client.js";
 import {
   isImageModel,
   isVideoGenModel,
@@ -10,10 +17,11 @@ import {
   filterModels,
   type KenariModel,
 } from "../src/kenari/catalog.js";
-import { sanitizeFilename, uniqueFilename, bytesFromDataUrl } from "../src/media/files.js";
+import { sanitizeFilename, uniqueFilename, bytesFromDataUrl, sniffExtFromBytes } from "../src/media/files.js";
 import {
   normalizeVideoStatus,
   isHttpUrl,
+  isHttpsUrl,
   isLocalPath,
   looksLikeJobId,
 } from "../src/media/video.js";
@@ -123,6 +131,134 @@ describe("source classifiers", () => {
   it("job ids", () => {
     assert.equal(looksLikeJobId("job_abc123"), true);
     assert.equal(looksLikeJobId("https://x/y"), false);
+  });
+});
+
+describe("Retry-After parsing (429)", () => {
+  it("parses delta-seconds and caps at 30s", () => {
+    assert.equal(parseRetryAfterMs("2"), 2000);
+    assert.equal(parseRetryAfterMs("120"), 30_000); // capped
+    assert.equal(parseRetryAfterMs("0"), 1000); // invalid -> default
+  });
+  it("parses HTTP-date; past date -> default", () => {
+    const future = new Date(Date.now() + 5000).toUTCString();
+    const ms = parseRetryAfterMs(future);
+    assert.ok(ms > 0 && ms <= 30_000, `ms=${ms}`);
+    assert.equal(parseRetryAfterMs(new Date(Date.now() - 60_000).toUTCString()), 1000);
+  });
+  it("missing/garbage header -> default 1000ms", () => {
+    assert.equal(parseRetryAfterMs(null), 1000);
+    assert.equal(parseRetryAfterMs(""), 1000);
+    assert.equal(parseRetryAfterMs("soon"), 1000);
+  });
+  it("KenariError carries retryAfterMs on 429", () => {
+    const e = toKenariError(429, "rate limited", "image", 2000);
+    assert.equal(e.code, "rate_limited");
+    assert.equal(e.retryAfterMs, 2000);
+    assert.equal(toKenariError(500, "boom", "image").retryAfterMs, undefined);
+  });
+});
+
+describe("retryAfterMs does not leak across 429 retry", () => {
+  const cfg = { baseUrl: "https://kenari.test/v1", apiKey: "kn-testkey123" } as const;
+
+  it("429 with Retry-After then 500 -> final error has no retryAfterMs", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response("rate limited", {
+            status: 429,
+            headers: { "retry-after": "0" }, // invalid -> 1000ms default wait
+          })
+        : new Response("boom", { status: 500, headers: { "content-type": "text/plain" } });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      postJson("/models", cfg, {}, { context: "models", fetchImpl }),
+      (e: unknown) => {
+        assert.ok(e instanceof KenariError);
+        assert.equal(e.status, 500);
+        assert.equal(e.code, "upstream_error");
+        assert.equal(e.retryAfterMs, undefined, "non-429 final must not carry first attempt's Retry-After");
+        return true;
+      },
+    );
+    assert.equal(calls, 2, "must retry exactly once");
+  });
+
+  it("429 then 429 -> final error keeps the retried 429's own Retry-After", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response("rate limited", { status: 429, headers: { "retry-after": "0" } })
+        : new Response("still limited", { status: 429, headers: { "retry-after": "5" } });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      postJson("/models", cfg, {}, { context: "models", fetchImpl }),
+      (e: unknown) => {
+        assert.ok(e instanceof KenariError);
+        assert.equal(e.status, 429);
+        assert.equal(e.code, "rate_limited");
+        assert.equal(e.retryAfterMs, 5000, "retried 429 carries its own Retry-After value");
+        return true;
+      },
+    );
+    assert.equal(calls, 2);
+  });
+
+  it("429 then 429 without its own Retry-After header -> keeps first attempt's value", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response("rate limited", { status: 429, headers: { "retry-after": "2" } })
+        : new Response("still limited", { status: 429 });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      postJson("/models", cfg, {}, { context: "models", fetchImpl }),
+      (e: unknown) => {
+        assert.ok(e instanceof KenariError);
+        assert.equal(e.status, 429);
+        assert.equal(e.retryAfterMs, 2000, "final 429 falls back to first attempt's value");
+        return true;
+      },
+    );
+    assert.equal(calls, 2);
+  });
+});
+
+describe("magic-byte sniffing", () => {
+  it("detects PNG / JPEG / GIF / WebP / WebM", () => {
+    assert.equal(sniffExtFromBytes(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])), ".png");
+    assert.equal(sniffExtFromBytes(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0])), ".jpg");
+    assert.equal(sniffExtFromBytes(Buffer.from("GIF89a....")), ".gif");
+    assert.equal(sniffExtFromBytes(Buffer.from("RIFF1234WEBPVP8 ")), ".webp");
+    assert.equal(sniffExtFromBytes(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0, 0, 0, 0, 0])), ".webm");
+  });
+  it("detects MP4 ftyp brands and MOV variants", () => {
+    const ftyp = (brand: string) =>
+      Buffer.concat([new Uint8Array([0, 0, 0, 0x18]), Buffer.from("ftyp"), Buffer.from(brand, "latin1"), new Uint8Array(4)]);
+    assert.equal(sniffExtFromBytes(ftyp("isom")), ".mp4");
+    assert.equal(sniffExtFromBytes(ftyp("M4V ")), ".mov");
+    assert.equal(sniffExtFromBytes(ftyp("qt  ")), ".mov");
+  });
+  it("unknown/short bytes return null", () => {
+    assert.equal(sniffExtFromBytes(Buffer.from("<html><body>hi there</body>")), null);
+    assert.equal(sniffExtFromBytes(new Uint8Array([0x89, 0x50])), null);
+    assert.equal(sniffExtFromBytes(null), null);
+  });
+});
+
+describe("https url classifier", () => {
+  it("accepts https only", () => {
+    assert.equal(isHttpsUrl("https://x/y.png"), true);
+    assert.equal(isHttpsUrl("HTTPS://x/y.png"), true);
+    assert.equal(isHttpsUrl("http://x/y.png"), false);
+    assert.equal(isHttpsUrl("file:///C:/x/y.png"), false);
+    assert.equal(isHttpsUrl("data:image/png;base64,aGk="), false);
+    assert.equal(isHttpsUrl("C:\\img\\a.png"), false);
+    assert.equal(isHttpsUrl("img/a.png"), false);
   });
 });
 
