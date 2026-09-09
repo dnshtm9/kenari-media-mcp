@@ -4,6 +4,15 @@
   "description": "Kenari media MCP server (images + videos)",
   "type": "module",
   "license": "MIT",
+  "author": "Exalt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dnshtm9/kenari-media-mcp.git"
+  },
+  "homepage": "https://github.com/dnshtm9/kenari-media-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/dnshtm9/kenari-media-mcp/issues"
+  },
   "engines": {
     "node": ">=20"
   },

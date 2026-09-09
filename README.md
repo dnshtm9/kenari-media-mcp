@@ -23,7 +23,7 @@ This project fills a gap: Kenari's own official MCP server covers docs, balance,
 This is the primary installation path until the package is published to npm (it is **not** on npm yet — `npx` will not work yet).
 
 ```bash
-git clone <repo-url>   # replace <repo-url> with the actual URL of this repository
+git clone https://github.com/dnshtm9/kenari-media-mcp.git
 cd kenari-media-mcp
 pnpm install
 pnpm build
